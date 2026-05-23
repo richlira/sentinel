@@ -81,6 +81,8 @@ _LOCAL_PROMPT = (
 
 
 def _extract_json_array(text: str):
+    # Strip markdown fences the model may wrap the JSON in.
+    text = re.sub(r"```(?:json)?", "", text)
     start = text.find("[")
     end = text.rfind("]")
     if start == -1 or end == -1 or end < start:
@@ -101,6 +103,14 @@ def route_to_local(spans: list[dict], timeout: int = 180) -> dict:
     if not cfg["local_url"]:
         raise RuntimeError("local_url not configured")
 
+    # Use Ollama's native endpoint with thinking disabled. gemma4:31b is a reasoning model;
+    # full thinking makes a 15-span batch take >3 min. think=false drops it to seconds with
+    # no quality loss for redaction/validation. Same server as /v1, just a different path.
+    base = cfg["local_url"].rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    url = base.rstrip("/") + "/api/chat"
+
     payload = {
         "model": cfg["model"],
         "messages": [
@@ -109,8 +119,9 @@ def route_to_local(spans: list[dict], timeout: int = 180) -> dict:
                 [{"id": s["id"], "category": s["category"], "value": s["text"]} for s in spans]
             )},
         ],
-        "max_tokens": 1536,
+        "think": False,
         "stream": False,
+        "options": {"num_predict": 4096, "temperature": 0},
     }
     headers = {"Content-Type": "application/json", "ngrok-skip-browser-warning": "true"}
     # Self-test only; in the sandbox the egress proxy injects this header.
@@ -118,7 +129,6 @@ def route_to_local(spans: list[dict], timeout: int = 180) -> dict:
     if token:
         headers["Authorization"] = "Bearer " + token
 
-    url = cfg["local_url"].rstrip("/") + "/chat/completions"
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
 
     t0 = time.time()
@@ -126,19 +136,23 @@ def route_to_local(spans: list[dict], timeout: int = 180) -> dict:
         body = json.loads(resp.read().decode())
     latency_ms = int((time.time() - t0) * 1000)
 
-    msg = body["choices"][0]["message"]
-    content = (msg.get("content") or "").strip()
-    if not content:
-        content = (msg.get("reasoning") or "").strip()
+    if "choices" in body:                       # OpenAI-compatible shape
+        msg = body["choices"][0]["message"]
+        content = (msg.get("content") or msg.get("reasoning") or "").strip()
+    else:                                        # Ollama native shape
+        content = (body.get("message", {}).get("content") or "").strip()
     derivatives = _extract_json_array(content) or []
 
-    return {
+    out = {
         "model": body.get("model", cfg["model"]),
         "endpoint_host": urlparse(url).hostname,
         "latency_ms": latency_ms,
         "derivatives": derivatives,
         "raw_content_len": len(content),
     }
+    if os.environ.get("SENTINEL_DEBUG_RAW"):
+        out["raw_content"] = content
+    return out
 
 
 # --- standalone self-test against the real tunnel ----------------------------------------
