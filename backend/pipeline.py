@@ -74,7 +74,7 @@ def run_local_pipeline(text: str, outdir: str, document: str = "input.md") -> It
             "spans_total": len(spans),
             "routed_local": len(sensitive),
             "processed_cloud": len(spans) - len(sensitive),
-            "raw_sensitive_bytes_to_cloud": 0,
+            "raw_sensitive_bytes_processed_in_cloud": 0,
             "local_model": route_meta.get("model", local._config()["model"]),
             "local_endpoint_host": route_meta.get("endpoint_host", ""),
         },

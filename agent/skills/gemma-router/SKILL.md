@@ -1,42 +1,31 @@
 ---
 name: gemma-router
-description: Route all sensitive spans in one consolidated request to the operator's local Gemma endpoint, which returns safe redacted derivatives. Raw sensitive data leaves the sandbox only toward the allowlisted local endpoint, with the auth header injected by the egress proxy.
+description: The contract for talking to the operator's local endpoint. One consolidated call, no credentials in code (the egress proxy injects them), and the only domain the sandbox may reach.
 ---
 
 # Skill: gemma-router
 
-This is the privacy boundary. Sensitive spans are processed **only** on the operator's
-local hardware. The cloud receives Gemma's safe answer, never the raw input.
+Defines *how* the sandbox talks to the local model. The local-redactor skill performs the call;
+this skill is the contract it must honor.
 
-## Procedure (via code_execution)
+## The call
 
-1. Collect every span whose `destination == "local-gemma"`.
-2. Send them **all at once** (one HTTP request — the local model is a slow reasoning model,
-   so minimize round-trips):
+- Use `tools.sentinel_local.redact_document(raw)` — a single consolidated request to the local
+  endpoint defined in `tools/sentinel_config.json`. Do not loop or make per-span network calls.
+- `redact_document` POSTs to the local model with thinking disabled (`think:false`) for speed.
+  It sets **no** `Authorization` header — in this sandbox the egress proxy injects it from the
+  network allowlist, so the credential never enters your code.
+- The endpoint is the **only** domain the sandbox is allowed to reach. Any other outbound
+  request will fail by design.
 
-   ```python
-   from tools.sentinel_local import route_to_local, emit
-   emit({"phase": "route", "status": "sending", "count": len(sensitive_spans)})
-   local_result = route_to_local(sensitive_spans)   # returns list of safe derivatives
-   emit({"phase": "route", "status": "received",
-         "latency_ms": local_result["latency_ms"]})
-   ```
+## What comes back
 
-   `route_to_local` POSTs to the local endpoint defined in `sentinel_config.json`. It does
-   **not** add an `Authorization` header — the egress proxy injects it from the network
-   allowlist, so the credential never enters this sandbox. The endpoint is the only domain
-   the sandbox is allowed to reach.
-
-3. The local model returns, per span, a **safe derivative** only: a redacted display value,
-   a validity/format check, and a category confirmation — never the raw value echoed back.
-   Example: SSN `524-71-9384` → `{"display": "SSN •••-••-9384", "valid_format": true}`.
-
-4. Process `non_sensitive` spans here in the sandbox (summarize / normalize as needed) and
-   emit `{"phase": "cloud", "span_id": ..., "destination": "cloud-sandbox"}` for each.
+A dict: `{"spans": [...], "model", "endpoint_host", "latency_ms", "document_sha256"}`. Each span
+is already a **safe derivative** — `{id, category, destination, preview (masked),
+safe_derivative:{display, valid_format, note}}`. The masking is performed deterministically by
+the helper, not by the model, so it is reliable even if the model is imperfect.
 
 ## Rules
 
-- One consolidated local call. Do not loop per-span over the network.
-- Never log the raw request body. After the call, keep only the safe derivatives.
-- If the local endpoint is unreachable, emit `{"phase": "route", "status": "error"}` and
-  mark those spans `unprocessed_local` — never fall back to processing them in the cloud.
+- Never reconstruct, log, or transmit the raw values. Keep only what `redact_document` returns.
+- Treat `endpoint_host` and `document_sha256` as the provenance/integrity anchors for the audit.

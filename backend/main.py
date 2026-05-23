@@ -13,20 +13,35 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from contextlib import asynccontextmanager
 from typing import Iterator
 
 from fastapi import FastAPI, File, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 
+import envcfg
 import pipeline
 import orchestrator
+import sentinel_local
+
+envcfg.load_env()
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNS_DIR = os.path.join(HERE, "runs")
 SYNTHETIC = os.path.join(HERE, "data", "synthetic_intake.md")
 
-app = FastAPI(title="Sentinel", version="1.0")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Warm the local model so the first real request isn't paying cold-start latency.
+    try:
+        sentinel_local.warm_up()
+    except Exception:
+        pass
+    yield
+
+
+app = FastAPI(title="Sentinel", version="1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],

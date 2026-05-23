@@ -44,7 +44,7 @@ def render_pdf(report: dict, path: str) -> None:
     pdf.set_text_color(*_LOCAL)
     pdf.set_font("Helvetica", "B", 11)
     pdf.multi_cell(0, 7, _latin1(
-        f"Raw sensitive bytes sent to cloud: {s['raw_sensitive_bytes_to_cloud']}   |   "
+        f"Raw sensitive bytes processed in cloud: {s.get('raw_sensitive_bytes_processed_in_cloud', 0)}   |   "
         f"Sensitive spans processed locally on {s.get('local_endpoint_host', 'local')} "
         f"by {s.get('local_model', 'local model')}."), fill=True)
     pdf.ln(3)
@@ -85,7 +85,8 @@ def render_pdf(report: dict, path: str) -> None:
         pdf.multi_cell(0, 6, _latin1(span.get("preview", "") + extra))
         pdf.set_text_color(*_MUTE)
         pdf.set_font("Helvetica", "", 7)
-        tail = f"sha256 {span['sha256'][:16]}"
+        sha = span.get("sha256", "")
+        tail = f"sha256 {sha[:16]}" if sha else ""
         if local and span.get("latency_ms") is not None:
             tail += f"   local latency {span['latency_ms']} ms"
         pdf.cell(0, 4, _latin1(tail), ln=1)

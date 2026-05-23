@@ -15,8 +15,8 @@ Discovered API shape (google-genai 2.6.0):
                              tools=[{"type":"code_execution"}], store=True)
 The `Api-Revision: 2026-05-20` header is injected automatically by the SDK.
 
-NOTE: live execution requires agent quota on the key (currently 429 on this account).
-The parsing/rendering below is exercised by the local pipeline's identical event contract.
+Privacy ordering: the agent's FIRST action delegates the RAW document to the local model
+(redact_document); it then operates only on the masked spans returned — never on raw.
 """
 
 from __future__ import annotations
@@ -29,11 +29,14 @@ from urllib.parse import urlparse
 
 from google.genai import Client
 
+import envcfg
 import report as report_mod
+
+envcfg.load_env()
 
 AGENT = "antigravity-preview-05-2026"
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_SKILLS = ["pii-classifier", "gemma-router", "pdf-generator"]
+_SKILLS = ["local-redactor", "gemma-router", "pdf-generator"]
 
 _EVENT_RE = re.compile(r"^SENTINEL_EVENT\s+(\{.*\})\s*$", re.M)
 _AUDIT_RE = re.compile(r"SENTINEL_AUDIT_BEGIN\s*(\{.*\})\s*SENTINEL_AUDIT_END", re.S)
@@ -49,11 +52,12 @@ def _read(path: str) -> str:
 
 
 def _local_config() -> dict:
-    cfg = {"local_url": "https://4390-12-94-170-82.ngrok-free.app/v1", "model": "gemma4:31b"}
+    cfg = {"local_url": "https://4390-12-94-170-82.ngrok-free.app", "model": "gemma4:e4b"}
     path = os.path.join(_ROOT, "agent", "tools", "sentinel_config.json")
     if os.path.exists(path):
         cfg.update(json.load(open(path)))
-    cfg["local_url"] = os.environ.get("SENTINEL_LOCAL_URL", cfg["local_url"])
+    cfg["local_url"] = os.environ.get("NGROK_URL") or os.environ.get("SENTINEL_LOCAL_URL") or cfg["local_url"]
+    cfg["model"] = os.environ.get("GEMMA_MODEL") or cfg["model"]
     return cfg
 
 
@@ -75,22 +79,22 @@ def _build_environment(text: str) -> dict:
         })
 
     host = urlparse(cfg["local_url"]).hostname
-    token = os.environ.get("SENTINEL_LOCAL_TOKEN", "REPLACE_WITH_TUNNEL_TOKEN")
-    network = {
-        "allowlist": [{
-            "domain": host,
-            "transform": [{"Authorization": f"Bearer {token}"}],
-        }]
-    }
+    rule = {"domain": host}
+    token = os.environ.get("SENTINEL_LOCAL_TOKEN")
+    if token:
+        # Egress proxy injects the bearer token; it never enters sandbox code.
+        rule["transform"] = [{"Authorization": f"Bearer {token}"}]
+    network = {"allowlist": [rule]}
     return {"type": "remote", "network": network, "sources": sources}
 
 
 _INPUT_INSTRUCTION = (
-    "Follow AGENTS.md exactly. Analyze the document at input.md. Work through the three "
-    "skills in order (classify, route sensitive spans to the local endpoint in ONE "
-    "consolidated call, then report). Emit a SENTINEL_EVENT line per decision and finish "
-    "with the SENTINEL_AUDIT_BEGIN / SENTINEL_AUDIT_END block exactly as the pdf-generator "
-    "skill specifies."
+    "Follow AGENTS.md exactly. Your FIRST action must be: read input.md as raw text and pass it "
+    "to tools.sentinel_local.redact_document() — the local model on the operator's hardware does "
+    "the classification. Do NOT read, classify, summarize, or reason over the raw document "
+    "yourself. Then operate ONLY on the masked spans it returns: emit one SENTINEL_EVENT per span "
+    "and finish with the SENTINEL_AUDIT_BEGIN / SENTINEL_AUDIT_END block exactly as the "
+    "pdf-generator skill specifies, with raw_sensitive_bytes_processed_in_cloud = 0."
 )
 
 
