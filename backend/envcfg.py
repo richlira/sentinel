@@ -1,7 +1,8 @@
 """Minimal stdlib .env loader (no python-dotenv dependency).
 
-Reads KEY=VALUE lines from the repo-root .env and sets them in os.environ WITHOUT
-overriding values already present (so a shell-exported GEMINI_API_KEY wins).
+Reads KEY=VALUE lines from the repo-root .env and makes them authoritative for this
+process: the project .env wins over inherited shell env (so the agent uses the key that
+has antigravity quota, not whatever happens to be exported globally).
 """
 
 from __future__ import annotations
@@ -21,4 +22,4 @@ def load_env(path: str | None = None) -> None:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, _, value = line.partition("=")
-            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+            os.environ[key.strip()] = value.strip().strip('"').strip("'")

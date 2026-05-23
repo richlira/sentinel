@@ -99,12 +99,51 @@ _INPUT_INSTRUCTION = (
 
 
 def _collect_stdout(interaction) -> str:
-    """Concatenate every code_execution result (stdout) from the interaction steps."""
+    """Concatenate tool output (stdout) from the interaction steps.
+
+    The antigravity agent runs code via either the `code_execution` tool
+    (`code_execution_result`, `.result` is a str) or its built-in shell/python tools
+    (`function_result`, `.result` is a list of {text} blocks), so handle both.
+    """
     chunks = []
     for step in interaction.steps or []:
-        if getattr(step, "type", None) == "code_execution_result" and getattr(step, "result", None):
-            chunks.append(step.result)
+        if getattr(step, "type", None) not in ("code_execution_result", "function_result"):
+            continue
+        res = getattr(step, "result", None)
+        if res is None:
+            continue
+        if isinstance(res, str):
+            chunks.append(res)
+        elif isinstance(res, list):
+            for item in res:
+                text = item.get("text") if isinstance(item, dict) else getattr(item, "text", None)
+                if text:
+                    chunks.append(text)
     return "\n".join(chunks)
+
+
+def _extract_report(stdout: str):
+    """Pull the report JSON from the LAST SENTINEL_AUDIT_BEGIN/END block that parses.
+
+    The concatenated stdout also contains the skills' own text (which includes the literal
+    marker strings as code examples), so scan from the last block backward and take the
+    first one whose inner JSON object parses.
+    """
+    starts = [m.start() for m in re.finditer("SENTINEL_AUDIT_BEGIN", stdout)]
+    for s in reversed(starts):
+        body = s + len("SENTINEL_AUDIT_BEGIN")
+        end = stdout.find("SENTINEL_AUDIT_END", body)
+        if end == -1:
+            continue
+        chunk = stdout[body:end]
+        b, l = chunk.find("{"), chunk.rfind("}")
+        if b == -1 or l <= b:
+            continue
+        try:
+            return json.loads(chunk[b : l + 1])
+        except json.JSONDecodeError:
+            continue
+    return None
 
 
 def run_agent_pipeline(text: str, outdir: str, document: str = "input.md") -> Iterator[dict]:
@@ -141,10 +180,9 @@ def run_agent_pipeline(text: str, outdir: str, document: str = "input.md") -> It
         except json.JSONDecodeError:
             continue
 
-    audit = _AUDIT_RE.search(stdout)
-    if not audit:
-        raise AgentUnavailable("no SENTINEL_AUDIT block in agent output")
-    report = json.loads(audit.group(1))
+    report = _extract_report(stdout)
+    if report is None:
+        raise AgentUnavailable("no parseable SENTINEL_AUDIT block in agent output")
 
     audit_path = os.path.join(outdir, "audit-log.json")
     pdf_path = os.path.join(outdir, "report.pdf")
