@@ -17,7 +17,7 @@ type Summary = {
   spans_total?: number;
   routed_local?: number;
   processed_cloud?: number;
-  raw_sensitive_bytes_to_cloud?: number;
+  raw_sensitive_bytes_processed_in_cloud?: number;
   local_model?: string;
   local_endpoint_host?: string;
 };
@@ -303,7 +303,7 @@ function SummaryBar({
   return (
     <div className="mt-6 grid grid-cols-1 gap-4 rounded-xl border border-local/30 bg-gradient-to-br from-local/10 to-transparent p-5 sm:grid-cols-[auto_1fr_auto] sm:items-center">
       <div className="text-center sm:text-left">
-        <div className="text-4xl font-bold text-local">{summary.raw_sensitive_bytes_to_cloud ?? 0}</div>
+        <div className="text-4xl font-bold text-local">{summary.raw_sensitive_bytes_processed_in_cloud ?? 0}</div>
         <div className="text-xs text-slate-400">raw sensitive bytes to cloud</div>
       </div>
       <div className="flex flex-wrap gap-x-8 gap-y-2 text-sm">
