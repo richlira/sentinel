@@ -65,7 +65,14 @@ export default function Home() {
             setNotice(String(e.message));
             break;
           case "classify": {
-            const span = e as unknown as Span;
+            const ev = e as Record<string, unknown>;
+            const span: Span = {
+              id: String(ev.span_id ?? ev.id ?? ""),
+              category: String(ev.category ?? ""),
+              destination: String(ev.destination ?? "cloud-sandbox"),
+              preview: String(ev.preview ?? ""),
+              sha256: typeof ev.sha256 === "string" ? ev.sha256 : "",
+            };
             setSpans((prev) => (prev.some((p) => p.id === span.id) ? prev : [...prev, span]));
             break;
           }
@@ -277,7 +284,7 @@ function SpanCard({ span, clear }: { span: Span; clear?: boolean }) {
         <span className={`rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase ${cat}`}>
           {span.category.replace("_", " ")}
         </span>
-        <span className="font-mono text-[9px] text-slate-600">{span.sha256.slice(0, 12)}</span>
+        <span className="font-mono text-[9px] text-slate-600">{span.sha256 ? span.sha256.slice(0, 12) : ""}</span>
       </div>
       <p className={`mt-2 font-mono text-[11px] ${clear ? "text-slate-300" : "text-slate-400"}`}>
         {span.preview}
