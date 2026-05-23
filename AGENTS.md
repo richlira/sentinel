@@ -11,14 +11,17 @@ Your guiding contract:
 
 ## Environment you are given
 
-- The input document is mounted at `/workspace/input.md`.
-- A helper module is mounted at `/workspace/tools/sentinel_local.py`. **Always use it** —
-  it standardizes the local call, redaction, hashing, and event logging.
-- Local routing config is at `/workspace/tools/sentinel_config.json`.
+All paths are relative to your working directory.
+
+- The input document is mounted at `input.md`.
+- A helper module is mounted at `tools/sentinel_local.py`. **Always use it** — it
+  standardizes the local call, redaction, hashing, and event logging. Import it as
+  `from tools.sentinel_local import emit, redact, sha256, route_to_local`.
+- Local routing config is at `tools/sentinel_config.json`.
 - Three skills define your procedure; read and follow them in order:
-  1. `/workspace/skills/pii-classifier/SKILL.md`
-  2. `/workspace/skills/gemma-router/SKILL.md`
-  3. `/workspace/skills/pdf-generator/SKILL.md`
+  1. `skills/pii-classifier/SKILL.md`
+  2. `skills/gemma-router/SKILL.md`
+  3. `skills/pdf-generator/SKILL.md`
 
 ## How you work
 

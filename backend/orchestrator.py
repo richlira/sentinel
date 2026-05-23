@@ -1,0 +1,162 @@
+"""Managed Agents orchestrator — the cloud path (prize centerpiece).
+
+Runs one interaction with the `antigravity-preview-05-2026` agent. The agent's behavior
+is defined by AGENTS.md and three skills, all mounted into the sandbox as inline
+environment sources alongside the stdlib helper, its config, and the input document.
+
+Privacy boundary, enforced by the platform:
+  * The sandbox network is locked to a single allowlisted domain — the operator's local
+    endpoint. Nothing else is reachable.
+  * The `Authorization: Bearer` header is injected by the egress proxy from the allowlist
+    `transform`, so the credential lives in the request config, never in sandbox code.
+
+Discovered API shape (google-genai 2.6.0):
+  client.interactions.create(agent=..., environment={type:"remote", network, sources},
+                             tools=[{"type":"code_execution"}], store=True)
+The `Api-Revision: 2026-05-20` header is injected automatically by the SDK.
+
+NOTE: live execution requires agent quota on the key (currently 429 on this account).
+The parsing/rendering below is exercised by the local pipeline's identical event contract.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from typing import Iterator
+from urllib.parse import urlparse
+
+from google.genai import Client
+
+import report as report_mod
+
+AGENT = "antigravity-preview-05-2026"
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_SKILLS = ["pii-classifier", "gemma-router", "pdf-generator"]
+
+_EVENT_RE = re.compile(r"^SENTINEL_EVENT\s+(\{.*\})\s*$", re.M)
+_AUDIT_RE = re.compile(r"SENTINEL_AUDIT_BEGIN\s*(\{.*\})\s*SENTINEL_AUDIT_END", re.S)
+
+
+class AgentUnavailable(RuntimeError):
+    """Raised when the cloud agent can't run (e.g. quota) so callers can fall back."""
+
+
+def _read(path: str) -> str:
+    with open(path) as fh:
+        return fh.read()
+
+
+def _local_config() -> dict:
+    cfg = {"local_url": "https://4390-12-94-170-82.ngrok-free.app/v1", "model": "gemma4:31b"}
+    path = os.path.join(_ROOT, "agent", "tools", "sentinel_config.json")
+    if os.path.exists(path):
+        cfg.update(json.load(open(path)))
+    cfg["local_url"] = os.environ.get("SENTINEL_LOCAL_URL", cfg["local_url"])
+    return cfg
+
+
+def _build_environment(text: str) -> dict:
+    """Inline-mount AGENTS.md, the three skills, the helper, its config, and the input."""
+    cfg = _local_config()
+    sources = [
+        {"type": "inline", "target": "AGENTS.md", "content": _read(os.path.join(_ROOT, "AGENTS.md"))},
+        {"type": "inline", "target": "tools/__init__.py", "content": ""},
+        {"type": "inline", "target": "tools/sentinel_local.py",
+         "content": _read(os.path.join(_ROOT, "agent", "tools", "sentinel_local.py"))},
+        {"type": "inline", "target": "tools/sentinel_config.json", "content": json.dumps(cfg)},
+        {"type": "inline", "target": "input.md", "content": text},
+    ]
+    for name in _SKILLS:
+        sources.append({
+            "type": "inline", "target": f"skills/{name}/SKILL.md",
+            "content": _read(os.path.join(_ROOT, "agent", "skills", name, "SKILL.md")),
+        })
+
+    host = urlparse(cfg["local_url"]).hostname
+    token = os.environ.get("SENTINEL_LOCAL_TOKEN", "REPLACE_WITH_TUNNEL_TOKEN")
+    network = {
+        "allowlist": [{
+            "domain": host,
+            "transform": [{"Authorization": f"Bearer {token}"}],
+        }]
+    }
+    return {"type": "remote", "network": network, "sources": sources}
+
+
+_INPUT_INSTRUCTION = (
+    "Follow AGENTS.md exactly. Analyze the document at input.md. Work through the three "
+    "skills in order (classify, route sensitive spans to the local endpoint in ONE "
+    "consolidated call, then report). Emit a SENTINEL_EVENT line per decision and finish "
+    "with the SENTINEL_AUDIT_BEGIN / SENTINEL_AUDIT_END block exactly as the pdf-generator "
+    "skill specifies."
+)
+
+
+def _collect_stdout(interaction) -> str:
+    """Concatenate every code_execution result (stdout) from the interaction steps."""
+    chunks = []
+    for step in interaction.steps or []:
+        if getattr(step, "type", None) == "code_execution_result" and getattr(step, "result", None):
+            chunks.append(step.result)
+    return "\n".join(chunks)
+
+
+def run_agent_pipeline(text: str, outdir: str, document: str = "input.md") -> Iterator[dict]:
+    """Run the cloud interaction and yield the parsed SENTINEL events + artifacts.
+
+    Same event shape as pipeline.run_local_pipeline so the SSE layer is mode-agnostic.
+    """
+    os.makedirs(outdir, exist_ok=True)
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise AgentUnavailable("GEMINI_API_KEY not set")
+    client = Client(api_key=api_key)
+
+    yield {"phase": "start", "mode": "cloud-agent", "document": document}
+    try:
+        interaction = client.interactions.create(
+            agent=AGENT,
+            input=_INPUT_INSTRUCTION,
+            environment=_build_environment(text),
+            tools=[{"type": "code_execution"}],
+            store=True,
+            timeout=600,
+        )
+    except Exception as exc:  # noqa: BLE001 - surface quota/availability cleanly
+        raise AgentUnavailable(str(exc)) from exc
+
+    if interaction.status != "completed":
+        raise AgentUnavailable(f"interaction status={interaction.status}")
+
+    stdout = _collect_stdout(interaction)
+    for match in _EVENT_RE.finditer(stdout):
+        try:
+            yield json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+
+    audit = _AUDIT_RE.search(stdout)
+    if not audit:
+        raise AgentUnavailable("no SENTINEL_AUDIT block in agent output")
+    report = json.loads(audit.group(1))
+
+    audit_path = os.path.join(outdir, "audit-log.json")
+    pdf_path = os.path.join(outdir, "report.pdf")
+    report_mod.write_audit_log(report, audit_path)
+    report_mod.render_pdf(report, pdf_path)
+    yield {"phase": "report", "audit_log": audit_path, "pdf": pdf_path}
+    yield {"phase": "done", "summary": report.get("summary", {}), "report": report}
+
+
+if __name__ == "__main__":
+    import sys
+    src = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), "data", "synthetic_intake.md")
+    out = os.path.join(os.path.dirname(__file__), "runs", "agent")
+    try:
+        for ev in run_agent_pipeline(_read(src), out, document=os.path.basename(src)):
+            print(json.dumps(ev)[:300])
+    except AgentUnavailable as e:
+        print(f"AGENT UNAVAILABLE: {e}")
+        print("Cloud agent path is wired and ready; run again when agent quota is available.")
