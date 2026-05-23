@@ -21,6 +21,10 @@ out/
 backend/runs/
 *.run.json
 
+# Playwright / scratch screenshots
+.playwright-mcp/
+/sentinel-*.png
+
 # OS / editor
 .DS_Store
 .idea/
