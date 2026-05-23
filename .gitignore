@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+.turbo/
+
+# Env & secrets
+.env
+.env.local
+.env*.local
+*.local.json
+
+# Sentinel runtime artifacts
+backend/runs/
+*.run.json
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
