@@ -66,11 +66,11 @@ def _get(url: str, timeout: int = 10) -> dict:
         return json.loads(r.read().decode())
 
 
-def _verify_event(v: dict, labels: dict) -> dict:
+def _verify_event(v: dict, field_of: dict) -> dict:
     """Shape a verify-log entry into a live SSE event (verdict only, no raw)."""
-    sid = v.get("span_id")
-    return {"phase": "verify", "span_id": sid, "field": labels.get(sid, sid),
-            "check": v.get("check"), "valid": v.get("valid"), "note": v.get("note")}
+    sid, chk = v.get("span_id"), v.get("check")
+    return {"phase": "verify", "span_id": sid, "field": field_of.get((sid, chk), sid),
+            "check": chk, "valid": v.get("valid"), "note": v.get("note")}
 
 
 def redact_on_device(text: str) -> dict:
@@ -128,25 +128,21 @@ def _verify_env(redacted_text: str | None = None, spans: list | None = None) -> 
     return env
 
 
-def _instruction(session_id: str, ssn_id: str | None, card_id: str | None) -> str:
-    targets = []
-    if ssn_id:
-        targets.append(f'span "{ssn_id}" with check "ssn_format"')
-    if card_id:
-        targets.append(f'span "{card_id}" with check "card_expired"')
-    target_str = " and ".join(targets) if targets else 'the SSN span with check "ssn_format"'
+def _instruction(session_id: str, checks: list) -> str:
+    pairs = ", ".join(f'("{c["span_id"]}","{c["check"]}")' for c in checks)
     return (
         "You are Sentinel's cloud reviewer. The document in redacted.md was ALREADY redacted on the "
         "operator's local hardware — you only have masked values. You do NOT have raw sensitive values "
         "and must never ask for them.\n\n"
         "Do EXACTLY this and nothing else — do NOT list files or read other paths:\n"
-        f"1. Verify {target_str}. For each, use code_execution to POST to {VERIFY_URL}/verify with body "
-        f'{{"session_id":"{session_id}","span_id":"<id>","check":"<check>"}} and header '
-        '"ngrok-skip-browser-warning: true". Do NOT set an Authorization header — the egress proxy injects it.\n'
-        "2. Reply in AT MOST 3 short sentences. Refer to the fields by NAME (the Social Security "
-        "Number, the credit card), NEVER by span id. State the two verdicts plainly, then ask the user "
-        "ONE concise question about how to proceed (e.g. whether it is safe to forward to billing). "
-        "Never reveal or guess a raw value."
+        "1. Run ONE code_execution Python script that loops over these (span_id, check) pairs and POSTs "
+        f"each to {VERIFY_URL}/verify (use urllib.request — the 'requests' library is NOT available; do "
+        "NOT set an Authorization header, the egress proxy injects it). Pairs: [" + pairs + "]. "
+        'Each request body: {"session_id":"' + session_id + '","span_id":<id>,"check":<check>}, with '
+        'header "ngrok-skip-browser-warning: true". Print each response.\n'
+        "2. Reply in AT MOST 3 short sentences. Refer to fields by NAME (Social Security Number, credit "
+        "card, bank routing number, email), NEVER by span id. Summarize the verdicts and ask the user "
+        "ONE concise question about whether it is safe to forward to billing. Never reveal a raw value."
     )
 
 
@@ -194,25 +190,30 @@ def run_localfirst_pipeline(text: str, outdir: str, document: str = "input.md") 
         "spans": red["spans"],
     }
 
-    # Pick the exact spans to verify so the agent is fast + correct (no guessing or exploring).
-    ssn_id = next((s["id"] for s in red["spans"]
-                   if s["category"] == "pii" and re.search(r"\d{3}-\d{2}-\d{4}", red["fields"].get(s["id"], ""))), None)
-    card_id = next((s["id"] for s in red["spans"]
-                    if s["category"] == "financial" and re.search(r"(0[1-9]|1[0-2])\s*/\s*\d{2}", red["fields"].get(s["id"], ""))), None)
+    # Pick the exact spans to verify (no guessing). Richer demo: SSN format, card expiry, card
+    # number (Luhn), bank routing (ABA), email — all run by the agent in one code_execution script.
+    def _find(cat: str, pat: str):
+        return next((s["id"] for s in red["spans"]
+                     if s["category"] == cat and re.search(pat, red["fields"].get(s["id"], ""), re.I)), None)
+    ssn_id = _find("pii", r"\d{3}-\d{2}-\d{4}")
+    card_id = _find("financial", r"(0[1-9]|1[0-2])\s*/\s*\d{2}")
+    routing_id = _find("financial", r"routing")
+    email_id = _find("pii", r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
-    labels = {}
+    checks = []
     if ssn_id:
-        labels[ssn_id] = "Social Security Number"
+        checks.append({"span_id": ssn_id, "field": "Social Security Number", "check": "ssn_format"})
     if card_id:
-        labels[card_id] = "Credit card"
+        checks.append({"span_id": card_id, "field": "Credit card", "check": "card_expired"})
+        checks.append({"span_id": card_id, "field": "Credit card number", "check": "card_luhn"})
+    if routing_id:
+        checks.append({"span_id": routing_id, "field": "Bank routing number", "check": "routing_aba"})
+    if email_id:
+        checks.append({"span_id": email_id, "field": "Email", "check": "email_format"})
+    field_of = {(c["span_id"], c["check"]): c["field"] for c in checks}
 
-    # Show the planned checks immediately as "pending" so the ~30s wait reads as live action.
-    pending = []
-    if ssn_id:
-        pending.append({"span_id": ssn_id, "field": labels[ssn_id], "check": "ssn_format"})
-    if card_id:
-        pending.append({"span_id": card_id, "field": labels[card_id], "check": "card_expired"})
-    yield {"phase": "verify_pending", "items": pending}
+    # Show the planned checks immediately as "pending" so the wait reads as live action.
+    yield {"phase": "verify_pending", "items": checks}
 
     # Run the agent in a thread; meanwhile poll the verify-service log and stream each callback
     # the instant the Spark answers — that's the live "wow" of cloud-verifying-without-possessing.
@@ -222,7 +223,7 @@ def run_localfirst_pipeline(text: str, outdir: str, document: str = "input.md") 
         try:
             client = _client()
             box["it"] = client.interactions.create(
-                agent=orchestrator.AGENT, input=_instruction(session_id, ssn_id, card_id),
+                agent=orchestrator.AGENT, input=_instruction(session_id, checks),
                 environment=_verify_env(red["redacted_text"], red["spans"]),
                 tools=[{"type": "code_execution"}], store=True, timeout=300,
             )
@@ -242,7 +243,7 @@ def run_localfirst_pipeline(text: str, outdir: str, document: str = "input.md") 
     while th.is_alive():
         q = _poll_log()
         for v in q[emitted:]:
-            yield _verify_event(v, labels)
+            yield _verify_event(v, field_of)
         emitted = max(emitted, len(q))
         time.sleep(1.0)
     th.join()

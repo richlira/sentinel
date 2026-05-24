@@ -23,7 +23,7 @@ notice. Parking is free for the first two hours in the structure on Elm Street.
 
 - Primary insurer: Summit Mutual Health (member ID SMH-44820173)
 - Bank account (autopay): Routing 102000076, Account 0049917283
-- Visa card on file: 4024 0071 5582 1190, exp 08/29
+- Visa card on file: 4111 1111 1111 1111, exp 08/29
 - Outstanding balance: $3,182.40
 - Annual household income (self-reported): $78,500
 

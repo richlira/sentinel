@@ -66,7 +66,8 @@ def _luhn(digits: str) -> bool:
 
 
 def _check_card_luhn(v: str) -> tuple[bool, str]:
-    return _luhn(v), "Passes Luhn checksum"
+    head = re.split(r"exp", v, flags=re.I)[0]   # card digits only, drop the expiry digits
+    return _luhn(re.sub(r"\D", "", head)), "Passes Luhn checksum"
 
 
 def _check_card_expired(v: str) -> tuple[bool, str]:
@@ -84,11 +85,11 @@ def _check_email_format(v: str) -> tuple[bool, str]:
 
 
 def _check_routing_aba(v: str) -> tuple[bool, str]:
-    d = [int(c) for c in v if c.isdigit()]
-    if len(d) != 9:
-        return False, "Routing must be 9 digits"
-    chk = (3 * (d[0] + d[3] + d[6]) + 7 * (d[1] + d[4] + d[7]) + (d[2] + d[5] + d[8])) % 10
-    return chk == 0, "ABA routing checksum"
+    for m in re.findall(r"\d{9}", v):   # find a 9-digit routing run (value may include an account no.)
+        d = [int(c) for c in m]
+        if (3 * (d[0] + d[3] + d[6]) + 7 * (d[1] + d[4] + d[7]) + (d[2] + d[5] + d[8])) % 10 == 0:
+            return True, "ABA routing checksum"
+    return False, "No valid 9-digit routing number"
 
 
 _CHECKS = {
