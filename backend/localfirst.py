@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import uuid
 import urllib.request
@@ -111,19 +112,24 @@ def _verify_env(redacted_text: str | None = None, spans: list | None = None) -> 
     return env
 
 
-def _instruction(session_id: str) -> str:
+def _instruction(session_id: str, ssn_id: str | None, card_id: str | None) -> str:
+    targets = []
+    if ssn_id:
+        targets.append(f'span "{ssn_id}" with check "ssn_format"')
+    if card_id:
+        targets.append(f'span "{card_id}" with check "card_expired"')
+    target_str = " and ".join(targets) if targets else 'the SSN span with check "ssn_format"'
     return (
-        "You are Sentinel's cloud reviewer. The document in redacted.md was ALREADY redacted on "
-        "the operator's local hardware — you only have masked values (e.g. '•••-••-9384'). You do "
-        "NOT have, and must never ask for, raw sensitive values.\n\n"
-        "To VERIFY a sensitive field, use code_execution to POST to the operator's local "
-        f"verification endpoint: {VERIFY_URL}/verify with JSON body "
-        f'{{"session_id":"{session_id}","span_id":"<id from spans.json>","check":"<check>"}} and header '
-        '\"ngrok-skip-browser-warning: true\". Do NOT add an Authorization header — the egress proxy '
-        f"injects it. Available checks: {', '.join(CHECKS)}. The endpoint returns ONLY a verdict.\n\n"
-        "Now: greet the user briefly, summarize what you see (counts by category), VERIFY at least "
-        "the SSN format and the card expiry to demonstrate, state the verdicts, then ask the user ONE "
-        "concise question about how to proceed. Never reveal or guess a raw value."
+        "You are Sentinel's cloud reviewer. The document in redacted.md was ALREADY redacted on the "
+        "operator's local hardware — you only have masked values. You do NOT have raw sensitive values "
+        "and must never ask for them.\n\n"
+        "Do EXACTLY this and nothing else — do NOT list files or read other paths:\n"
+        f"1. Verify {target_str}. For each, use code_execution to POST to {VERIFY_URL}/verify with body "
+        f'{{"session_id":"{session_id}","span_id":"<id>","check":"<check>"}} and header '
+        '"ngrok-skip-browser-warning: true". Do NOT set an Authorization header — the egress proxy injects it.\n'
+        "2. Reply in AT MOST 3 short sentences: state the two verdicts plainly, then ask the user ONE "
+        "concise question about how to proceed (e.g. whether it is safe to forward to billing). "
+        "Never reveal or guess a raw value."
     )
 
 
@@ -171,12 +177,18 @@ def run_localfirst_pipeline(text: str, outdir: str, document: str = "input.md") 
         "spans": red["spans"],
     }
 
+    # Pick the exact spans to verify so the agent is fast + correct (no guessing or exploring).
+    ssn_id = next((s["id"] for s in red["spans"]
+                   if s["category"] == "pii" and re.search(r"\d{3}-\d{2}-\d{4}", red["fields"].get(s["id"], ""))), None)
+    card_id = next((s["id"] for s in red["spans"]
+                    if s["category"] == "financial" and re.search(r"(0[1-9]|1[0-2])\s*/\s*\d{2}", red["fields"].get(s["id"], ""))), None)
+
     interaction_id = None
     agent_text = ""
     try:
         client = _client()
         it = client.interactions.create(
-            agent=orchestrator.AGENT, input=_instruction(session_id),
+            agent=orchestrator.AGENT, input=_instruction(session_id, ssn_id, card_id),
             environment=_verify_env(red["redacted_text"], red["spans"]),
             tools=[{"type": "code_execution"}], store=True, timeout=300,
         )
@@ -208,7 +220,9 @@ def continue_interaction(interaction_id: str, message: str, session_id: str | No
     the allowlist is re-supplied so the agent can still verify fields mid-conversation."""
     client = _client()
     it = client.interactions.create(
-        agent=orchestrator.AGENT, input=message, previous_interaction_id=interaction_id,
+        agent=orchestrator.AGENT,
+        input=message + "\n\n(Reply in at most 3 short sentences; verify via the endpoint only if needed.)",
+        previous_interaction_id=interaction_id,
         environment=_verify_env(), tools=[{"type": "code_execution"}], store=True, timeout=300,
     )
     verifications = []

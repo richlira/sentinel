@@ -47,7 +47,8 @@ _QUERY_LOG: dict[str, list] = {}
 
 # --- verification checks: each takes the raw value, returns (valid, note). No raw in note. ---
 def _check_ssn_format(v: str) -> tuple[bool, str]:
-    return bool(re.fullmatch(r"\d{3}-\d{2}-\d{4}", v.strip())), "US SSN format ###-##-####"
+    # search (not fullmatch): the stored value may include a label, e.g. "SSN: 524-71-9384".
+    return bool(re.search(r"\b\d{3}-\d{2}-\d{4}\b", v)), "US SSN format ###-##-####"
 
 
 def _luhn(digits: str) -> bool:
