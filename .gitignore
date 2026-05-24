@@ -21,9 +21,12 @@ out/
 backend/runs/
 *.run.json
 
+# Pitch assets (kept out of the repo)
+pitch/
+
 # Playwright / scratch screenshots
 .playwright-mcp/
-/sentinel-*.png
+/*.png
 
 # OS / editor
 .DS_Store

@@ -1,7 +1,10 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { API_BASE, fetchSynthetic, streamAnalyze, type SentinelEvent } from "@/lib/sse";
+import { API_BASE, fetchSynthetic, streamAnalyze, sendChat, type SentinelEvent } from "@/lib/sse";
+
+type Mode = "localfirst" | "agent" | "local";
+type ChatMsg = { role: "agent" | "user"; text: string };
 
 type Span = {
   id: string;
@@ -31,14 +34,18 @@ const CAT_COLOR: Record<string, string> = {
 
 export default function Home() {
   const [doc, setDoc] = useState("");
-  const [mode, setMode] = useState<"local" | "agent">("local");
+  const [mode, setMode] = useState<Mode>("localfirst");
   const [running, setRunning] = useState(false);
-  const [status, setStatus] = useState<"idle" | "classifying" | "routing" | "done">("idle");
+  const [status, setStatus] = useState<"idle" | "classifying" | "routing" | "reviewing" | "done">("idle");
   const [spans, setSpans] = useState<Span[]>([]);
   const [summary, setSummary] = useState<Summary | null>(null);
   const [artifacts, setArtifacts] = useState<{ pdf?: string; audit_log?: string }>({});
   const [notice, setNotice] = useState<string | null>(null);
   const [routeMs, setRouteMs] = useState(0);
+  const [messages, setMessages] = useState<ChatMsg[]>([]);
+  const [interactionId, setInteractionId] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [chatBusy, setChatBusy] = useState(false);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -57,6 +64,9 @@ export default function Home() {
     setArtifacts({});
     setNotice(null);
     setRouteMs(0);
+    setMessages([]);
+    setInteractionId(null);
+    setSessionId(null);
 
     try {
       await streamAnalyze({ mode }, async (e: SentinelEvent) => {
@@ -103,8 +113,16 @@ export default function Home() {
             } catch { /* keep masked previews */ }
             break;
           }
+          case "handoff":
+            setStatus("reviewing");
+            break;
+          case "agent_message":
+            setMessages((m) => [...m, { role: "agent", text: String(e.text) }]);
+            break;
           case "done":
             setSummary(e.summary as Summary);
+            if (e.interaction_id) setInteractionId(String(e.interaction_id));
+            if (e.session_id) setSessionId(String(e.session_id));
             setStatus("done");
             break;
         }
@@ -114,6 +132,21 @@ export default function Home() {
     } finally {
       if (timer.current) clearInterval(timer.current);
       setRunning(false);
+    }
+  }
+
+  async function sendChatTurn(text: string) {
+    if (!interactionId) return;
+    setMessages((m) => [...m, { role: "user", text }]);
+    setChatBusy(true);
+    try {
+      const r = await sendChat(interactionId, text, sessionId ?? undefined);
+      if (r.reply) setMessages((m) => [...m, { role: "agent", text: r.reply as string }]);
+      if (r.interaction_id) setInteractionId(r.interaction_id);
+    } catch (err) {
+      setMessages((m) => [...m, { role: "agent", text: "Error: " + String(err) }]);
+    } finally {
+      setChatBusy(false);
     }
   }
 
@@ -127,26 +160,23 @@ export default function Home() {
         </div>
       )}
 
-      <StatusStrip status={status} routeMs={routeMs} localCount={local.length} />
+      <StatusStrip status={status} routeMs={routeMs} localCount={local.length} mode={mode} />
 
       <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-[320px_1fr]">
         <DocPanel doc={doc} />
-        <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
-          <Column
-            title="Cloud Sandbox"
-            sub="Managed Agent · non-sensitive"
-            accent="cloud"
-            spans={cloud}
-            clear
-          />
-          <Column
-            title="Local · DGX Spark"
-            sub="Gemma 4 31B · sensitive only"
-            accent="local"
-            spans={local}
-            busy={status === "routing"}
-          />
-        </div>
+        {mode === "localfirst" ? (
+          <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
+            <Column title="Local · DGX Spark" sub="redacted on-device · raw stays here"
+                    accent="local" spans={local} busy={running && status === "classifying"} />
+            <ChatPanel messages={messages} busy={chatBusy || status === "reviewing"}
+                       canChat={!!interactionId && !running} onSend={sendChatTurn} />
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
+            <Column title="Cloud Sandbox" sub="Managed Agent · non-sensitive" accent="cloud" spans={cloud} clear />
+            <Column title="Local · DGX Spark" sub="Gemma · sensitive only" accent="local" spans={local} busy={status === "routing"} />
+          </div>
+        )}
       </div>
 
       {summary && <SummaryBar summary={summary} artifacts={artifacts} routeMs={routeMs} />}
@@ -162,8 +192,8 @@ export default function Home() {
 function Header({
   mode, setMode, running, onRun, status,
 }: {
-  mode: "local" | "agent";
-  setMode: (m: "local" | "agent") => void;
+  mode: Mode;
+  setMode: (m: Mode) => void;
   running: boolean;
   onRun: () => void;
   status: string;
@@ -185,16 +215,16 @@ function Header({
       </div>
       <div className="flex items-center gap-3">
         <div className="flex rounded-lg border border-edge bg-panel p-0.5 text-xs">
-          {(["local", "agent"] as const).map((m) => (
+          {(["localfirst", "agent", "local"] as const).map((m) => (
             <button
               key={m}
               onClick={() => setMode(m)}
               disabled={running}
-              className={`rounded-md px-3 py-1.5 capitalize transition ${
+              className={`rounded-md px-3 py-1.5 transition ${
                 mode === m ? "bg-slate-700 text-white" : "text-slate-400 hover:text-slate-200"
               }`}
             >
-              {m === "agent" ? "Cloud agent" : "Local"}
+              {m === "localfirst" ? "Local-First" : m === "agent" ? "Cloud agent" : "Local"}
             </button>
           ))}
         </div>
@@ -210,15 +240,17 @@ function Header({
   );
 }
 
-function StatusStrip({ status, routeMs, localCount }: { status: string; routeMs: number; localCount: number }) {
+function StatusStrip({ status, routeMs, localCount, mode }: { status: string; routeMs: number; localCount: number; mode: Mode }) {
   const label =
     status === "idle" ? "Ready" :
-    status === "classifying" ? "Classifying spans in the cloud sandbox…" :
+    status === "classifying" ? (mode === "localfirst" ? "Redacting on your hardware — raw never leaves…" : "Classifying spans in the cloud sandbox…") :
     status === "routing" ? `Routing ${localCount} sensitive spans to local Gemma — egress proxy injecting Authorization…` :
+    status === "reviewing" ? "Managed Agent reviewing the redacted data + verifying fields via callback…" :
     "Complete — evidence generated.";
+  const active = status === "routing" || status === "reviewing";
   return (
     <div className="mt-5 flex items-center gap-3 rounded-lg border border-edge bg-panel px-4 py-3 text-sm">
-      <span className={`h-2.5 w-2.5 rounded-full ${status === "routing" ? "animate-pulseflow bg-local" : status === "done" ? "bg-local" : "bg-slate-500"}`} />
+      <span className={`h-2.5 w-2.5 rounded-full ${active ? "animate-pulseflow bg-local" : status === "done" ? "bg-local" : "bg-slate-500"}`} />
       <span className="text-slate-300">{label}</span>
       {status === "routing" && (
         <span className="ml-auto font-mono text-xs text-slate-400">{(routeMs / 1000).toFixed(1)}s</span>
@@ -235,6 +267,61 @@ function DocPanel({ doc }: { doc: string }) {
         {doc || "Loading synthetic document…"}
       </pre>
     </aside>
+  );
+}
+
+function ChatPanel({
+  messages, busy, canChat, onSend,
+}: {
+  messages: ChatMsg[];
+  busy: boolean;
+  canChat: boolean;
+  onSend: (text: string) => void;
+}) {
+  const [input, setInput] = useState("");
+  return (
+    <section className="flex flex-col rounded-xl border border-cloud/40 bg-panel p-4">
+      <div className="mb-3 flex items-center gap-2">
+        <span className="h-2 w-2 rounded-full bg-cloud" />
+        <h2 className="text-sm font-semibold text-white">Managed Agent</h2>
+        <span className="ml-auto text-[10px] uppercase tracking-wider text-slate-500">redacted data only</span>
+      </div>
+      <div className="flex min-h-[300px] flex-1 flex-col gap-3 overflow-auto">
+        {messages.length === 0 && (
+          <p className="py-10 text-center text-xs text-slate-600">
+            The agent reviews the redacted document and verifies fields by calling back to your
+            local model — then asks you a question.
+          </p>
+        )}
+        {messages.map((m, i) => (
+          <div key={i} className={`max-w-[92%] rounded-lg px-3 py-2 text-[12px] leading-relaxed ${
+            m.role === "agent" ? "self-start border border-edge bg-ink/60 text-slate-200" : "self-end bg-cloud/20 text-slate-100"}`}>
+            <div className="mb-0.5 text-[9px] uppercase tracking-wider text-slate-500">{m.role === "agent" ? "agent" : "you"}</div>
+            <div className="whitespace-pre-wrap">{m.text}</div>
+          </div>
+        ))}
+        {busy && <div className="self-start text-xs text-emerald-300/80"><span className="animate-pulseflow">● agent thinking…</span></div>}
+      </div>
+      <form
+        className="mt-3 flex gap-2"
+        onSubmit={(ev) => { ev.preventDefault(); if (input.trim() && canChat && !busy) { onSend(input.trim()); setInput(""); } }}
+      >
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          disabled={!canChat || busy}
+          placeholder={canChat ? "Ask the agent about the redacted data…" : "Run a Local-First analysis first"}
+          className="flex-1 rounded-lg border border-edge bg-ink/60 px-3 py-2 text-sm text-slate-200 placeholder:text-slate-600 disabled:opacity-50"
+        />
+        <button
+          type="submit"
+          disabled={!canChat || busy}
+          className="rounded-lg bg-cloud/80 px-4 py-2 text-sm font-medium text-white transition hover:bg-cloud disabled:opacity-50"
+        >
+          Send
+        </button>
+      </form>
+    </section>
   );
 }
 

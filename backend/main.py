@@ -16,13 +16,15 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Iterator
 
-from fastapi import FastAPI, File, UploadFile, Query
+from fastapi import FastAPI, File, UploadFile, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 import envcfg
 import pipeline
 import orchestrator
+import localfirst
 import sentinel_local
 
 envcfg.load_env()
@@ -69,7 +71,9 @@ def _run_stream(text: str, document: str, mode: str) -> Iterator[str]:
     yield _sse({"phase": "run", "run_id": run_id, "mode_requested": mode})
 
     gen = None
-    if mode == "agent":
+    if mode == "localfirst":
+        gen = localfirst.run_localfirst_pipeline(text, outdir, document=document)
+    elif mode == "agent":
         try:
             gen = orchestrator.run_agent_pipeline(text, outdir, document=document)
             first = next(gen)            # forces the create() call / quota check
@@ -87,7 +91,9 @@ def _run_stream(text: str, document: str, mode: str) -> Iterator[str]:
             if event.get("phase") == "report":
                 event = _artifact_urls(run_id, event)
             elif event.get("phase") == "done":
-                event = {"phase": "done", "summary": event.get("summary", {})}
+                event = {"phase": "done", "summary": event.get("summary", {}),
+                         **({"interaction_id": event["interaction_id"]} if event.get("interaction_id") else {}),
+                         **({"session_id": event["session_id"]} if event.get("session_id") else {})}
             yield _sse(event)
     except Exception as exc:  # noqa: BLE001 - report failures to the client
         yield _sse({"phase": "error", "message": str(exc)})
@@ -102,7 +108,7 @@ def synthetic() -> JSONResponse:
 @app.post("/api/analyze")
 async def analyze(
     file: UploadFile | None = File(default=None),
-    mode: str = Query(default="local", pattern="^(local|agent)$"),
+    mode: str = Query(default="localfirst", pattern="^(localfirst|local|agent)$"),
 ) -> StreamingResponse:
     if file is not None:
         text = (await file.read()).decode("utf-8", errors="replace")
@@ -116,6 +122,22 @@ async def analyze(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/api/chat")
+async def chat(request: Request) -> JSONResponse:
+    body = await request.json()
+    interaction_id = body.get("interaction_id")
+    message = body.get("message", "")
+    if not interaction_id or not message:
+        return JSONResponse({"error": "interaction_id and message required"}, status_code=400)
+    try:
+        # Run the blocking agent call off the event loop so it never freezes the server.
+        result = await run_in_threadpool(
+            localfirst.continue_interaction, interaction_id, message, body.get("session_id"))
+        return JSONResponse(result)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 @app.get("/api/artifacts/{run_id}/{name}")

@@ -11,7 +11,7 @@ export type SentinelEvent = {
  * only supports GET, and we need multipart upload + POST). Calls onEvent per event.
  */
 export async function streamAnalyze(
-  opts: { mode: "local" | "agent"; file?: File },
+  opts: { mode: "localfirst" | "local" | "agent"; file?: File },
   onEvent: (e: SentinelEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
@@ -51,5 +51,19 @@ export async function streamAnalyze(
 
 export async function fetchSynthetic(): Promise<{ document: string; text: string }> {
   const res = await fetch(`${API_BASE}/api/synthetic`);
+  return res.json();
+}
+
+/** Local-First multi-turn chat: continue the agent interaction over the redacted data. */
+export async function sendChat(
+  interactionId: string,
+  message: string,
+  sessionId?: string,
+): Promise<{ reply?: string; interaction_id?: string; verifications?: unknown[]; error?: string }> {
+  const res = await fetch(`${API_BASE}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ interaction_id: interactionId, message, session_id: sessionId }),
+  });
   return res.json();
 }
