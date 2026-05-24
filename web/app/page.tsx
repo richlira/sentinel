@@ -5,6 +5,15 @@ import { API_BASE, fetchSynthetic, streamAnalyze, sendChat, type SentinelEvent }
 
 type Mode = "localfirst" | "agent" | "local";
 type ChatMsg = { role: "agent" | "user"; text: string };
+type Verification = { span_id: string; field: string; check: string; valid: boolean; note: string };
+
+const CHECK_LABEL: Record<string, string> = {
+  ssn_format: "in a valid format",
+  card_expired: "still valid (not expired)",
+  card_luhn: "a valid card number",
+  routing_aba: "a valid routing number",
+  email_format: "a valid email",
+};
 
 type Span = {
   id: string;
@@ -46,6 +55,7 @@ export default function Home() {
   const [interactionId, setInteractionId] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [chatBusy, setChatBusy] = useState(false);
+  const [verifications, setVerifications] = useState<Verification[]>([]);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -55,6 +65,7 @@ export default function Home() {
 
   const cloud = useMemo(() => spans.filter((s) => s.destination === "cloud-sandbox"), [spans]);
   const local = useMemo(() => spans.filter((s) => s.destination === "local-gemma"), [spans]);
+  const verifiedIds = useMemo(() => new Set(verifications.map((v) => v.span_id)), [verifications]);
 
   async function run() {
     setRunning(true);
@@ -67,6 +78,7 @@ export default function Home() {
     setMessages([]);
     setInteractionId(null);
     setSessionId(null);
+    setVerifications([]);
 
     try {
       await streamAnalyze({ mode }, async (e: SentinelEvent) => {
@@ -116,6 +128,17 @@ export default function Home() {
           case "handoff":
             setStatus("reviewing");
             break;
+          case "verify": {
+            const ev = e as Record<string, unknown>;
+            setVerifications((prev) => [...prev, {
+              span_id: String(ev.span_id ?? ""),
+              field: String(ev.field ?? ev.span_id ?? ""),
+              check: String(ev.check ?? ""),
+              valid: Boolean(ev.valid),
+              note: String(ev.note ?? ""),
+            }]);
+            break;
+          }
           case "agent_message":
             setMessages((m) => [...m, { role: "agent", text: String(e.text) }]);
             break;
@@ -167,9 +190,13 @@ export default function Home() {
         {mode === "localfirst" ? (
           <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
             <Column title="Local · DGX Spark" sub="redacted on-device · raw stays here"
-                    accent="local" spans={local} busy={running && status === "classifying"} />
-            <ChatPanel messages={messages} busy={chatBusy || status === "reviewing"}
-                       canChat={!!interactionId && !running} onSend={sendChatTurn} />
+                    accent="local" spans={local} busy={running && status === "classifying"}
+                    verifiedIds={verifiedIds} />
+            <div className="flex flex-col gap-5">
+              <VerificationFeed verifications={verifications} reviewing={status === "reviewing"} done={status === "done"} />
+              <ChatPanel messages={messages} busy={chatBusy || status === "reviewing"}
+                         canChat={!!interactionId && !running} onSend={sendChatTurn} />
+            </div>
           </div>
         ) : (
           <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
@@ -325,8 +352,56 @@ function ChatPanel({
   );
 }
 
+function VerificationFeed({
+  verifications, reviewing, done,
+}: {
+  verifications: Verification[];
+  reviewing: boolean;
+  done: boolean;
+}) {
+  if (verifications.length === 0 && !reviewing) return null;
+  return (
+    <section className="rounded-xl border border-local/40 bg-panel p-4">
+      <div className="mb-3 flex items-center gap-2">
+        <span className="h-2 w-2 rounded-full bg-local" />
+        <h2 className="text-sm font-semibold text-white">Verification callbacks</h2>
+        <span className="ml-auto text-[10px] uppercase tracking-wider text-slate-500">
+          {done && verifications.length > 0
+            ? `${verifications.length} verified · 0 exposed`
+            : "cloud → your hardware → verdict"}
+        </span>
+      </div>
+      <div className="flex flex-col gap-2">
+        {verifications.length === 0 && reviewing && (
+          <p className="py-3 text-xs text-emerald-300/80">
+            <span className="animate-pulseflow">● the cloud agent is interrogating your local model…</span>
+          </p>
+        )}
+        {verifications.map((v, i) => (
+          <div key={i} className="animate-slidein rounded-lg border border-edge bg-ink/60 p-3">
+            <div className="flex items-center gap-2 text-[12px]">
+              <span>🔐</span>
+              <span className="text-slate-200">
+                Is the <b className="text-white">{v.field}</b> {CHECK_LABEL[v.check] ?? v.check}?
+              </span>
+              <span className={`ml-auto rounded px-2 py-0.5 text-[10px] font-semibold ${
+                v.valid ? "bg-local/20 text-local" : "bg-rose-500/20 text-rose-300"}`}>
+                {v.valid ? "✓ VALID" : "✗ INVALID"}
+              </span>
+            </div>
+            <div className="mt-1 flex items-center justify-between text-[10px] text-slate-500">
+              <span>cloud agent → your DGX Spark → verdict</span>
+              <span className="text-emerald-500/80">the value never left your hardware</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function Column({
-  title, sub, accent, spans, clear, busy,
+  title, sub, accent, spans, clear, busy, verifiedIds,
 }: {
   title: string;
   sub: string;
@@ -334,6 +409,7 @@ function Column({
   spans: Span[];
   clear?: boolean;
   busy?: boolean;
+  verifiedIds?: Set<string>;
 }) {
   const ring = accent === "local" ? "border-local/40" : "border-cloud/40";
   const dot = accent === "local" ? "bg-local" : "bg-cloud";
@@ -355,23 +431,25 @@ function Column({
       <div className="flex flex-col gap-2">
         {spans.length === 0 && <p className="py-6 text-center text-xs text-slate-600">No spans yet</p>}
         {spans.map((s) => (
-          <SpanCard key={s.id} span={s} clear={clear} />
+          <SpanCard key={s.id} span={s} clear={clear} verified={verifiedIds?.has(s.id)} />
         ))}
       </div>
     </section>
   );
 }
 
-function SpanCard({ span, clear }: { span: Span; clear?: boolean }) {
+function SpanCard({ span, clear, verified }: { span: Span; clear?: boolean; verified?: boolean }) {
   const cat = CAT_COLOR[span.category] ?? CAT_COLOR.non_sensitive;
   const d = span.safe_derivative;
   return (
-    <div className="animate-slidein rounded-lg border border-edge bg-ink/60 p-3">
+    <div className={`animate-slidein rounded-lg border bg-ink/60 p-3 ${verified ? "border-local/50" : "border-edge"}`}>
       <div className="flex items-center justify-between">
         <span className={`rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase ${cat}`}>
           {span.category.replace("_", " ")}
         </span>
-        <span className="font-mono text-[9px] text-slate-600">{span.sha256 ? span.sha256.slice(0, 12) : ""}</span>
+        {verified
+          ? <span className="rounded bg-local/20 px-1.5 py-0.5 text-[9px] font-semibold text-local">✓ verified</span>
+          : <span className="font-mono text-[9px] text-slate-600">{span.sha256 ? span.sha256.slice(0, 12) : ""}</span>}
       </div>
       <p className={`mt-2 font-mono text-[11px] ${clear ? "text-slate-300" : "text-slate-400"}`}>
         {span.preview}

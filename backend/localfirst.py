@@ -22,6 +22,8 @@ import json
 import os
 import re
 import sys
+import threading
+import time
 import uuid
 import urllib.request
 from datetime import datetime, timezone
@@ -55,6 +57,13 @@ def _post(url: str, body: dict, timeout: int = 30) -> dict:
 def _get(url: str, timeout: int = 10) -> dict:
     with urllib.request.urlopen(url, timeout=timeout) as r:
         return json.loads(r.read().decode())
+
+
+def _verify_event(v: dict, labels: dict) -> dict:
+    """Shape a verify-log entry into a live SSE event (verdict only, no raw)."""
+    sid = v.get("span_id")
+    return {"phase": "verify", "span_id": sid, "field": labels.get(sid, sid),
+            "check": v.get("check"), "valid": v.get("valid"), "note": v.get("note")}
 
 
 def redact_on_device(text: str) -> dict:
@@ -127,8 +136,9 @@ def _instruction(session_id: str, ssn_id: str | None, card_id: str | None) -> st
         f"1. Verify {target_str}. For each, use code_execution to POST to {VERIFY_URL}/verify with body "
         f'{{"session_id":"{session_id}","span_id":"<id>","check":"<check>"}} and header '
         '"ngrok-skip-browser-warning: true". Do NOT set an Authorization header — the egress proxy injects it.\n'
-        "2. Reply in AT MOST 3 short sentences: state the two verdicts plainly, then ask the user ONE "
-        "concise question about how to proceed (e.g. whether it is safe to forward to billing). "
+        "2. Reply in AT MOST 3 short sentences. Refer to the fields by NAME (the Social Security "
+        "Number, the credit card), NEVER by span id. State the two verdicts plainly, then ask the user "
+        "ONE concise question about how to proceed (e.g. whether it is safe to forward to billing). "
         "Never reveal or guess a raw value."
     )
 
@@ -183,19 +193,55 @@ def run_localfirst_pipeline(text: str, outdir: str, document: str = "input.md") 
     card_id = next((s["id"] for s in red["spans"]
                     if s["category"] == "financial" and re.search(r"(0[1-9]|1[0-2])\s*/\s*\d{2}", red["fields"].get(s["id"], ""))), None)
 
+    labels = {}
+    if ssn_id:
+        labels[ssn_id] = "Social Security Number"
+    if card_id:
+        labels[card_id] = "Credit card"
+
+    # Run the agent in a thread; meanwhile poll the verify-service log and stream each callback
+    # the instant the Spark answers — that's the live "wow" of cloud-verifying-without-possessing.
+    box: dict = {}
+
+    def _run_agent() -> None:
+        try:
+            client = _client()
+            box["it"] = client.interactions.create(
+                agent=orchestrator.AGENT, input=_instruction(session_id, ssn_id, card_id),
+                environment=_verify_env(red["redacted_text"], red["spans"]),
+                tools=[{"type": "code_execution"}], store=True, timeout=300,
+            )
+        except Exception as exc:  # noqa: BLE001
+            box["err"] = exc
+
+    th = threading.Thread(target=_run_agent, daemon=True)
+    th.start()
+    emitted = 0
+
+    def _poll_log() -> list:
+        try:
+            return _get(f"{VERIFY_LOCAL_URL}/session/{session_id}/log").get("queries", [])
+        except Exception:
+            return []
+
+    while th.is_alive():
+        q = _poll_log()
+        for v in q[emitted:]:
+            yield _verify_event(v, labels)
+        emitted = max(emitted, len(q))
+        time.sleep(1.0)
+    th.join()
+    for v in _poll_log()[emitted:]:   # flush any verdicts that landed right before completion
+        yield _verify_event(v, labels)
+
     interaction_id = None
     agent_text = ""
-    try:
-        client = _client()
-        it = client.interactions.create(
-            agent=orchestrator.AGENT, input=_instruction(session_id, ssn_id, card_id),
-            environment=_verify_env(red["redacted_text"], red["spans"]),
-            tools=[{"type": "code_execution"}], store=True, timeout=300,
-        )
-        interaction_id = it.id
-        agent_text = it.output_text or ""
-    except Exception as exc:  # noqa: BLE001
-        yield {"phase": "notice", "message": f"Cloud agent unavailable ({exc}); redaction + report still produced locally."}
+    if "err" in box:
+        yield {"phase": "notice",
+               "message": f"Cloud agent unavailable ({box['err']}); redaction + report still produced locally."}
+    elif box.get("it") is not None:
+        interaction_id = box["it"].id
+        agent_text = box["it"].output_text or ""
 
     # Pull the verification verdict log into the audit (no raw).
     try:
