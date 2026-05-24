@@ -41,6 +41,13 @@ from google.genai import Client  # noqa: E402
 VERIFY_LOCAL_URL = os.environ.get("VERIFY_LOCAL_URL", "http://127.0.0.1:8799").rstrip("/")
 VERIFY_URL = (os.environ.get("VERIFY_URL", "") or VERIFY_LOCAL_URL).rstrip("/")
 CHECKS = ["ssn_format", "card_luhn", "card_expired", "routing_aba", "email_format"]
+CHECK_FACT = {
+    "ssn_format": "the Social Security Number format",
+    "card_expired": "the credit card expiry",
+    "card_luhn": "the credit card number",
+    "routing_aba": "the routing number",
+    "email_format": "the email format",
+}
 
 
 def _now() -> str:
@@ -199,6 +206,14 @@ def run_localfirst_pipeline(text: str, outdir: str, document: str = "input.md") 
     if card_id:
         labels[card_id] = "Credit card"
 
+    # Show the planned checks immediately as "pending" so the ~30s wait reads as live action.
+    pending = []
+    if ssn_id:
+        pending.append({"span_id": ssn_id, "field": labels[ssn_id], "check": "ssn_format"})
+    if card_id:
+        pending.append({"span_id": card_id, "field": labels[card_id], "check": "card_expired"})
+    yield {"phase": "verify_pending", "items": pending}
+
     # Run the agent in a thread; meanwhile poll the verify-service log and stream each callback
     # the instant the Spark answers — that's the live "wow" of cloud-verifying-without-possessing.
     box: dict = {}
@@ -261,20 +276,37 @@ def run_localfirst_pipeline(text: str, outdir: str, document: str = "input.md") 
            "interaction_id": interaction_id, "session_id": session_id}
 
 
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "gemini-2.5-flash")
+
+
 def continue_interaction(interaction_id: str, message: str, session_id: str | None = None) -> dict:
-    """One more chat turn. Context (the redacted bundle) is carried by previous_interaction_id;
-    the allowlist is re-supplied so the agent can still verify fields mid-conversation."""
-    client = _client()
-    it = client.interactions.create(
-        agent=orchestrator.AGENT,
-        input=message + "\n\n(Reply in at most 3 short sentences; verify via the endpoint only if needed.)",
-        previous_interaction_id=interaction_id,
-        environment=_verify_env(), tools=[{"type": "code_execution"}], store=True, timeout=300,
-    )
+    """Fast chat turn on Gemini Flash.
+
+    Follow-up questions reason over the verdicts the local model already returned — they need no
+    new egress — so we answer with a fast plain-model interaction (~4s) instead of the ~30s agent.
+    (The secure verification callback still runs on the antigravity agent during the initial run;
+    the egress allowlist is only honored for agent interactions.)
+    """
     verifications = []
     if session_id:
         try:
             verifications = _get(f"{VERIFY_LOCAL_URL}/session/{session_id}/log").get("queries", [])
         except Exception:
             verifications = []
+    facts = "; ".join(
+        f"{CHECK_FACT.get(v.get('check'), v.get('check'))} is {'valid' if v.get('valid') else 'invalid'}"
+        for v in verifications
+    ) or "none verified yet"
+
+    prompt = (
+        "You are Sentinel's privacy reviewer. The document was redacted on the operator's LOCAL "
+        "hardware; you only know these locally-verified facts and NEVER the raw values: " + facts + ". "
+        "Answer the user's question in AT MOST 3 short sentences, referring to fields by name (the "
+        "Social Security Number, the credit card). If they ask to verify something not in the facts, "
+        "say it would need a new local verification.\n\nUser: " + message
+    )
+    client = _client()
+    it = client.interactions.create(
+        model=CHAT_MODEL, input=prompt, environment={"type": "remote"}, store=True, timeout=60,
+    )
     return {"reply": it.output_text or "", "interaction_id": it.id, "verifications": verifications}

@@ -5,7 +5,7 @@ import { API_BASE, fetchSynthetic, streamAnalyze, sendChat, type SentinelEvent }
 
 type Mode = "localfirst" | "agent" | "local";
 type ChatMsg = { role: "agent" | "user"; text: string };
-type Verification = { span_id: string; field: string; check: string; valid: boolean; note: string };
+type Verification = { span_id: string; field: string; check: string; valid: boolean; note: string; pending?: boolean };
 
 const CHECK_LABEL: Record<string, string> = {
   ssn_format: "in a valid format",
@@ -65,7 +65,10 @@ export default function Home() {
 
   const cloud = useMemo(() => spans.filter((s) => s.destination === "cloud-sandbox"), [spans]);
   const local = useMemo(() => spans.filter((s) => s.destination === "local-gemma"), [spans]);
-  const verifiedIds = useMemo(() => new Set(verifications.map((v) => v.span_id)), [verifications]);
+  const verifiedIds = useMemo(
+    () => new Set(verifications.filter((v) => !v.pending && v.valid).map((v) => v.span_id)),
+    [verifications],
+  );
 
   async function run() {
     setRunning(true);
@@ -128,15 +131,29 @@ export default function Home() {
           case "handoff":
             setStatus("reviewing");
             break;
+          case "verify_pending": {
+            const items = (e.items as Record<string, unknown>[]) ?? [];
+            setVerifications(items.map((it) => ({
+              span_id: String(it.span_id ?? ""), field: String(it.field ?? ""),
+              check: String(it.check ?? ""), valid: false, note: "", pending: true,
+            })));
+            break;
+          }
           case "verify": {
             const ev = e as Record<string, unknown>;
-            setVerifications((prev) => [...prev, {
+            const v: Verification = {
               span_id: String(ev.span_id ?? ""),
               field: String(ev.field ?? ev.span_id ?? ""),
               check: String(ev.check ?? ""),
               valid: Boolean(ev.valid),
               note: String(ev.note ?? ""),
-            }]);
+              pending: false,
+            };
+            setVerifications((prev) => {
+              const idx = prev.findIndex((p) => p.span_id === v.span_id && p.check === v.check && p.pending);
+              if (idx >= 0) { const next = [...prev]; next[idx] = v; return next; }
+              return [...prev, v];
+            });
             break;
           }
           case "agent_message":
@@ -367,7 +384,7 @@ function VerificationFeed({
         <h2 className="text-sm font-semibold text-white">Verification callbacks</h2>
         <span className="ml-auto text-[10px] uppercase tracking-wider text-slate-500">
           {done && verifications.length > 0
-            ? `${verifications.length} verified · 0 exposed`
+            ? `${verifications.filter((v) => !v.pending).length} verified · 0 exposed`
             : "cloud → your hardware → verdict"}
         </span>
       </div>
@@ -384,10 +401,12 @@ function VerificationFeed({
               <span className="text-slate-200">
                 Is the <b className="text-white">{v.field}</b> {CHECK_LABEL[v.check] ?? v.check}?
               </span>
-              <span className={`ml-auto rounded px-2 py-0.5 text-[10px] font-semibold ${
-                v.valid ? "bg-local/20 text-local" : "bg-rose-500/20 text-rose-300"}`}>
-                {v.valid ? "✓ VALID" : "✗ INVALID"}
-              </span>
+              {v.pending
+                ? <span className="ml-auto text-[10px] text-emerald-300/80"><span className="animate-pulseflow">● asking Spark…</span></span>
+                : <span className={`ml-auto rounded px-2 py-0.5 text-[10px] font-semibold ${
+                    v.valid ? "bg-local/20 text-local" : "bg-rose-500/20 text-rose-300"}`}>
+                    {v.valid ? "✓ VALID" : "✗ INVALID"}
+                  </span>}
             </div>
             <div className="mt-1 flex items-center justify-between text-[10px] text-slate-500">
               <span>cloud agent → your DGX Spark → verdict</span>
